@@ -3,6 +3,7 @@ const cors = require('cors');
 const app = express();
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY)
 const port = process.env.PORT || 5000;
 
 // middleware 
@@ -30,6 +31,7 @@ async function run() {
     const reviewCollection = client.db("bistroDb").collection("reviews")
     const cartCollection = client.db("bistroDb").collection("carts")
     const userCollection = client.db("bistroDb").collection("users")
+    const paymentCollection = client.db("bistroDb").collection("payments")
 
 
     // JWT related api 
@@ -201,6 +203,116 @@ async function run() {
       const query = { _id: new ObjectId(id) }
       const result = await cartCollection.deleteOne(query);
       res.send(result);
+
+    });
+
+    // payment intetnt
+    app.post('/create-payment-intent', async(req, res) =>{
+      const {price} = req.body;
+      const amount = parseInt(price * 100);
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount : amount,
+        currency: "usd",
+        payment_method_types: ['card']
+      });
+      res.send({
+        clientSecret: paymentIntent.client_secret,
+      })
+
+    })
+
+    app.post('/payments', async(req, res)=>{
+      const payment = req.body;
+      const paymentResult = await paymentCollection.insertOne(payment);
+
+      // carefully delete each item from the cart
+      console.log('payment info', payment);
+      const query = {_id: {
+        $in: payment.cartIds.map(id => new ObjectId(id))
+      }};
+
+      const deleteResult = await cartCollection.deleteMany(query);
+    res.send({paymentResult, deleteResult});
+
+    })
+
+    //stats or analytics
+    app.get('/admin-stats',verifyToken,verifyAdmin,async(req,res)=>{
+      const users = await userCollection.estimatedDocumentCount();
+      const menuItems = await menuCollection.estimatedDocumentCount();
+      const orders = await paymentCollection.estimatedDocumentCount();
+      
+      // this not the best way
+      // const payments = await paymentCollection.find().toArray();
+      // const revenue = payments.reduce((total, payment) =>total + payment.price, 0)
+
+      const result = await paymentCollection.aggregate([
+        {
+          $group: {
+            _id: null,
+            totalRevenue: {
+              $sum:'$price'
+            }
+          }
+        }
+      ]).toArray();
+
+      const revenue = result.length > 0 ? result[0].totalRevenue: 0;
+
+     
+      res.send({
+        users,
+        menuItems,
+        orders,
+        revenue
+      })
+    })
+
+    app.get('/payments/:email',verifyToken, async(req, res)=>{
+      const query = {email: req.params.email}
+      if(req.params.email !== req.decoded.email){
+        return res.status(403).send({message:'forbidden access'})
+      }
+      const result = await paymentCollection.find(query).toArray();
+      res.send(result);
+    })
+    // src/pages/Dashboard/Payment/__payment_steps__.js
+
+    // using aggregate pipeline
+    app.get('/order-stats',verifyToken,verifyAdmin, async(req, res) =>{
+      const result = await paymentCollection.aggregate([
+        {
+          $unwind: '$menuItemIds'
+        },
+        {
+          $lookup:{
+            from:'menu',
+            localField:'menuItemIds',
+            foreignField:'_id',
+            as:'menuItems'
+          }
+        },
+        {
+          $unwind: '$menuItems'
+        },
+        {
+          $group:{
+            _id: '$menuItems.category',
+            quantity:{ $sum:1},
+            revenue:{$sum: '$menuItems.price'}
+          }
+        },
+        {
+          $project: {
+            _id:0,
+            category:'$_id',
+            quantity: '$quantity',
+            revenue: '$revenue'
+          }
+        }
+      ]).toArray();
+
+      res.send(result)
 
     })
 
